@@ -51,11 +51,16 @@ var (
 	namespace      string
 	containerImage string
 
-	fioCheckerSize     string
-	fioNodeSelector    map[string]string
-	fioCheckerFilePath string
-	fioCheckerTestName string
-	fioCmd             = &cobra.Command{
+	fioCheckerSize       string
+	fioNodeSelector      map[string]string
+	fioCheckerFilePath   string
+	fioCheckerTestName   string
+	fioVolumeHandle      string
+	fioMountOptions      []string
+	fioServiceAccount    string
+	fioCSIDriver         string
+	fioPodAnnotations    map[string]string
+	fioCmd               = &cobra.Command{
 		Use:   "fio",
 		Short: "Runs an fio test",
 		Long:  `Run an fio test`,
@@ -63,7 +68,7 @@ var (
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			return Fio(ctx, output, outfile, storageClass, fioCheckerSize, namespace, fioNodeSelector, fioCheckerTestName, fioCheckerFilePath, containerImage)
+			return Fio(ctx, output, outfile, storageClass, fioCheckerSize, namespace, fioNodeSelector, fioCheckerTestName, fioCheckerFilePath, containerImage, fioVolumeHandle, fioMountOptions, fioServiceAccount, fioCSIDriver, fioPodAnnotations)
 		},
 	}
 
@@ -194,8 +199,13 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&outfile, "outfile", "e", "", "The file where test results will be written")
 
 	rootCmd.AddCommand(fioCmd)
-	fioCmd.Flags().StringVarP(&storageClass, "storageclass", "s", "", "The name of a Storageclass. (Required)")
-	_ = fioCmd.MarkFlagRequired("storageclass")
+	fioCmd.Flags().StringVarP(&storageClass, "storageclass", "s", "", "The name of a Storageclass (mutually exclusive with --volume-handle).")
+	fioCmd.Flags().StringVarP(&fioVolumeHandle, "volume-handle", "v", "", "CSI volume handle for static PV (mutually exclusive with --storageclass).")
+	fioCmd.Flags().StringVarP(&fioCSIDriver, "csi-driver", "d", "", "CSI driver name for static PV. Required when using --volume-handle.")
+	fioCmd.Flags().StringSliceVarP(&fioMountOptions, "mount-options", "m", []string{}, "Mount options for static PV.")
+	fioCmd.Flags().StringToStringVarP(&fioPodAnnotations, "pod-annotations", "p", map[string]string{}, "Annotations to add to the FIO pod.")
+	fioCmd.Flags().StringVarP(&fioServiceAccount, "service-account", "a", "", "Service account for the FIO pod.")
+	fioCmd.MarkFlagsMutuallyExclusive("storageclass", "volume-handle")
 	fioCmd.Flags().StringVarP(&fioCheckerSize, "size", "z", fio.DefaultPVCSize, "The size of the volume used to run FIO. Note that the FIO job definition is not scaled accordingly.")
 	fioCmd.Flags().StringVarP(&namespace, "namespace", "n", fio.DefaultNS, "The namespace used to run FIO.")
 	fioCmd.Flags().StringToStringVarP(&fioNodeSelector, "nodeselector", "N", map[string]string{}, "Node selector applied to pod.")
@@ -313,7 +323,7 @@ func PrintAndJsonOutput(result []*kubestr.TestOutput, output string, outfile str
 }
 
 // Fio executes the FIO test.
-func Fio(ctx context.Context, output, outfile, storageclass, size, namespace string, nodeSelector map[string]string, jobName, fioFilePath string, containerImage string) error {
+func Fio(ctx context.Context, output, outfile, storageclass, size, namespace string, nodeSelector map[string]string, jobName, fioFilePath string, containerImage string, volumeHandle string, mountOptions []string, serviceAccount string, csiDriver string, podAnnotations map[string]string) error {
 	cli, err := kubestr.LoadKubeCli()
 	if err != nil {
 		fmt.Println(err.Error())
@@ -332,6 +342,11 @@ func Fio(ctx context.Context, output, outfile, storageclass, size, namespace str
 		FIOJobName:     jobName,
 		FIOJobFilepath: fioFilePath,
 		Image:          containerImage,
+		VolumeHandle:   volumeHandle,
+		MountOptions:   mountOptions,
+		ServiceAccount: serviceAccount,
+		CSIDriver:      csiDriver,
+		PodAnnotations: podAnnotations,
 	})
 	if err != nil {
 		result = kubestr.MakeTestOutput(testName, kubestr.StatusError, err.Error(), fioResult)

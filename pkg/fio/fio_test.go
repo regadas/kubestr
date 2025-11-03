@@ -339,7 +339,7 @@ func (f *fakeFioStepper) deletePVC(ctx context.Context, pvcName, namespace strin
 	f.steps = append(f.steps, "DPVC")
 	return f.dPVCErr
 }
-func (f *fakeFioStepper) createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string) (*v1.Pod, error) {
+func (f *fakeFioStepper) createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string, podAnnotations map[string]string, serviceAccount string) (*v1.Pod, error) {
 	f.steps = append(f.steps, "CPOD")
 	f.cPodExpCM = configMapName
 	f.cPodExpFN = testFileName
@@ -357,6 +357,26 @@ func (f *fakeFioStepper) runFIOCommand(ctx context.Context, podName, containerNa
 func (f *fakeFioStepper) deleteConfigMap(ctx context.Context, configMap *v1.ConfigMap, namespace string) error {
 	f.steps = append(f.steps, "DCM")
 	return nil
+}
+func (f *fakeFioStepper) createPV(ctx context.Context, volumeHandle string, size string, mountOptions []string, csiDriver string) (*v1.PersistentVolume, error) {
+	f.steps = append(f.steps, "CPV")
+	return &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fake-pv",
+		},
+	}, nil
+}
+func (f *fakeFioStepper) deletePV(ctx context.Context, pvName string) error {
+	f.steps = append(f.steps, "DPV")
+	return nil
+}
+func (f *fakeFioStepper) createStaticPVC(ctx context.Context, pvName, size, namespace string, csiDriver string) (*v1.PersistentVolumeClaim, error) {
+	f.steps = append(f.steps, "CSPVC")
+	return &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fake-pvc",
+		},
+	}, nil
 }
 
 func (s *FIOTestSuite) TestStorageClassExists(c *C) {
@@ -696,7 +716,7 @@ func (s *FIOTestSuite) TestCreatPod(c *C) {
 		if tc.reactor != nil {
 			stepper.cli.(*fake.Clientset).ReactionChain = tc.reactor
 		}
-		pod, err := stepper.createPod(ctx, tc.pvcName, tc.configMapName, tc.testFileName, DefaultNS, tc.nodeSelector, tc.image)
+		pod, err := stepper.createPod(ctx, tc.pvcName, tc.configMapName, tc.testFileName, DefaultNS, tc.nodeSelector, tc.image, map[string]string{}, "")
 		c.Check(err, tc.errChecker)
 		if err == nil {
 			c.Assert(pod.GenerateName, Equals, PodGenerateName)
