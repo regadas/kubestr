@@ -68,18 +68,39 @@ type RunFIOArgs struct {
 	FIOJobFilepath string
 	FIOJobName     string
 	Image          string
+	VolumeHandle   string
+	CSIDriver      string
+	MountOptions   []string
+	PodAnnotations map[string]string
+	ServiceAccount string
 }
 
 func (a *RunFIOArgs) Validate() error {
-	if a.StorageClass == "" || a.Size == "" || a.Namespace == "" {
-		return fmt.Errorf("required fields are missing: (StorageClass, Size, Namespace)")
+	if a.Size == "" || a.Namespace == "" {
+		return fmt.Errorf("required fields are missing: (Size, Namespace)")
+	}
+	if a.StorageClass == "" && a.VolumeHandle == "" {
+		return fmt.Errorf("either StorageClass or VolumeHandle must be specified")
+	}
+	if a.StorageClass != "" && a.VolumeHandle != "" {
+		return fmt.Errorf("StorageClass and VolumeHandle are mutually exclusive")
+	}
+	if a.VolumeHandle != "" && a.CSIDriver == "" {
+		return fmt.Errorf("CSIDriver must be specified when using VolumeHandle")
 	}
 	return nil
+}
+
+func (a *RunFIOArgs) IsStaticPVMode() bool {
+	return a.VolumeHandle != ""
 }
 
 type RunFIOResult struct {
 	Size         string            `json:"size,omitempty"`
 	StorageClass *sv1.StorageClass `json:"storageClass,omitempty"`
+	VolumeHandle string            `json:"volumeHandle,omitempty"`
+	MountOptions []string          `json:"mountOptions,omitempty"`
+	PVName       string            `json:"pvName,omitempty"`
 	FioConfig    string            `json:"fioConfig,omitempty"`
 	Result       FioResult         `json:"result,omitempty"`
 }
@@ -112,9 +133,16 @@ func (f *FIOrunner) RunFioHelper(ctx context.Context, args *RunFIOArgs) (*RunFIO
 		return nil, errors.Wrapf(err, "unable to find nodes satisfying node selector (%v)", args.NodeSelector)
 	}
 
-	sc, err := f.fioSteps.storageClassExists(ctx, args.StorageClass)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot find StorageClass")
+	var sc *sv1.StorageClass
+	var pv *v1.PersistentVolume
+	var pvc *v1.PersistentVolumeClaim
+	var err error
+
+	if !args.IsStaticPVMode() {
+		sc, err = f.fioSteps.storageClassExists(ctx, args.StorageClass)
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot find StorageClass")
+		}
 	}
 
 	configMap, err := f.fioSteps.loadConfigMap(ctx, args)
@@ -130,16 +158,36 @@ func (f *FIOrunner) RunFioHelper(ctx context.Context, args *RunFIOArgs) (*RunFIO
 		return nil, errors.Wrap(err, "failed to get test file name")
 	}
 
-	pvc, err := f.fioSteps.createPVC(ctx, args.StorageClass, args.Size, args.Namespace)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create PVC")
-	}
-	defer func() {
-		_ = f.fioSteps.deletePVC(context.TODO(), pvc.Name, args.Namespace)
-	}()
-	fmt.Println("PVC created", pvc.Name)
+	if args.IsStaticPVMode() {
+		pv, err = f.fioSteps.createPV(ctx, args.VolumeHandle, args.Size, args.MountOptions, args.CSIDriver)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create PV")
+		}
+		defer func() {
+			_ = f.fioSteps.deletePV(context.TODO(), pv.Name)
+		}()
+		fmt.Println("PV created", pv.Name)
 
-	pod, err := f.fioSteps.createPod(ctx, pvc.Name, configMap.Name, testFileName, args.Namespace, args.NodeSelector, args.Image)
+		pvc, err = f.fioSteps.createStaticPVC(ctx, pv.Name, args.Size, args.Namespace, args.CSIDriver)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create PVC")
+		}
+		defer func() {
+			_ = f.fioSteps.deletePVC(context.TODO(), pvc.Name, args.Namespace)
+		}()
+		fmt.Println("PVC created", pvc.Name)
+	} else {
+		pvc, err = f.fioSteps.createPVC(ctx, args.StorageClass, args.Size, args.Namespace)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create PVC")
+		}
+		defer func() {
+			_ = f.fioSteps.deletePVC(context.TODO(), pvc.Name, args.Namespace)
+		}()
+		fmt.Println("PVC created", pvc.Name)
+	}
+
+	pod, err := f.fioSteps.createPod(ctx, pvc.Name, configMap.Name, testFileName, args.Namespace, args.NodeSelector, args.Image, args.PodAnnotations, args.ServiceAccount)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create POD")
 	}
@@ -147,17 +195,33 @@ func (f *FIOrunner) RunFioHelper(ctx context.Context, args *RunFIOArgs) (*RunFIO
 		_ = f.fioSteps.deletePod(context.TODO(), pod.Name, args.Namespace)
 	}()
 	fmt.Println("Pod created", pod.Name)
-	fmt.Printf("Running FIO test (%s) on StorageClass (%s) with a PVC of Size (%s)\n", testFileName, args.StorageClass, args.Size)
+
+	if args.IsStaticPVMode() {
+		fmt.Printf("Running FIO test (%s) on VolumeHandle (%s) with a PVC of Size (%s)\n", testFileName, args.VolumeHandle, args.Size)
+	} else {
+		fmt.Printf("Running FIO test (%s) on StorageClass (%s) with a PVC of Size (%s)\n", testFileName, args.StorageClass, args.Size)
+	}
+
 	fioOutput, err := f.fioSteps.runFIOCommand(ctx, pod.Name, ContainerName, testFileName, args.Namespace)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed while running FIO test")
 	}
-	return &RunFIOResult{
-		Size:         args.Size,
-		StorageClass: sc,
-		FioConfig:    configMap.Data[testFileName],
-		Result:       fioOutput,
-	}, nil
+
+	result := &RunFIOResult{
+		Size:      args.Size,
+		FioConfig: configMap.Data[testFileName],
+		Result:    fioOutput,
+	}
+
+	if args.IsStaticPVMode() {
+		result.VolumeHandle = args.VolumeHandle
+		result.MountOptions = args.MountOptions
+		result.PVName = pv.Name
+	} else {
+		result.StorageClass = sc
+	}
+
+	return result, nil
 }
 
 type fioSteps interface {
@@ -167,10 +231,13 @@ type fioSteps interface {
 	loadConfigMap(ctx context.Context, args *RunFIOArgs) (*v1.ConfigMap, error)
 	createPVC(ctx context.Context, storageclass, size, namespace string) (*v1.PersistentVolumeClaim, error)
 	deletePVC(ctx context.Context, pvcName, namespace string) error
-	createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string) (*v1.Pod, error)
+	createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string, podAnnotations map[string]string, serviceAccount string) (*v1.Pod, error)
 	deletePod(ctx context.Context, podName, namespace string) error
 	runFIOCommand(ctx context.Context, podName, containerName, testFileName, namespace string) (FioResult, error)
 	deleteConfigMap(ctx context.Context, configMap *v1.ConfigMap, namespace string) error
+	createPV(ctx context.Context, volumeHandle string, size string, mountOptions []string, csiDriver string) (*v1.PersistentVolume, error)
+	deletePV(ctx context.Context, pvName string) error
+	createStaticPVC(ctx context.Context, pvName, size, namespace string, csiDriver string) (*v1.PersistentVolumeClaim, error)
 }
 
 type fioStepper struct {
@@ -264,7 +331,7 @@ func (s *fioStepper) deletePVC(ctx context.Context, pvcName, namespace string) e
 	return s.cli.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, pvcName, metav1.DeleteOptions{})
 }
 
-func (s *fioStepper) createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string) (*v1.Pod, error) {
+func (s *fioStepper) createPod(ctx context.Context, pvcName, configMapName, testFileName, namespace string, nodeSelector map[string]string, image string, podAnnotations map[string]string, serviceAccount string) (*v1.Pod, error) {
 	if pvcName == "" || configMapName == "" || testFileName == "" {
 		return nil, fmt.Errorf("create pod missing required arguments")
 	}
@@ -273,42 +340,53 @@ func (s *fioStepper) createPod(ctx context.Context, pvcName, configMapName, test
 		image = common.DefaultPodImage
 	}
 
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: PodGenerateName,
-			Namespace:    namespace,
+	podMetadata := metav1.ObjectMeta{
+		GenerateName: PodGenerateName,
+		Namespace:    namespace,
+		Annotations:  podAnnotations,
+	}
+
+	volumes := []v1.Volume{
+		{
+			Name: "persistent-storage",
+			VolumeSource: v1.VolumeSource{
+				PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+			},
 		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{{
-				Name:    ContainerName,
-				Command: []string{"/bin/sh"},
-				Args:    []string{"-c", "tail -f /dev/null"},
-				VolumeMounts: []v1.VolumeMount{
-					{Name: "persistent-storage", MountPath: VolumeMountPath},
-					{Name: "config-map", MountPath: ConfigMapMountPath},
-				},
-				Image: image,
-			}},
-			Volumes: []v1.Volume{
-				{
-					Name: "persistent-storage",
-					VolumeSource: v1.VolumeSource{
-						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
-					},
-				},
-				{
-					Name: "config-map",
-					VolumeSource: v1.VolumeSource{
-						ConfigMap: &v1.ConfigMapVolumeSource{
-							LocalObjectReference: v1.LocalObjectReference{
-								Name: configMapName,
-							},
-						},
+		{
+			Name: "config-map",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: configMapName,
 					},
 				},
 			},
-			NodeSelector: nodeSelector,
 		},
+	}
+
+	podSpec := v1.PodSpec{
+		Containers: []v1.Container{{
+			Name:    ContainerName,
+			Command: []string{"/bin/sh"},
+			Args:    []string{"-c", "tail -f /dev/null"},
+			VolumeMounts: []v1.VolumeMount{
+				{Name: "persistent-storage", MountPath: VolumeMountPath},
+				{Name: "config-map", MountPath: ConfigMapMountPath},
+			},
+			Image: image,
+		}},
+		Volumes:      volumes,
+		NodeSelector: nodeSelector,
+	}
+
+	if serviceAccount != "" {
+		podSpec.ServiceAccountName = serviceAccount
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: podMetadata,
+		Spec:       podSpec,
 	}
 	podRes, err := s.cli.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -375,6 +453,78 @@ func (s *fioStepper) deleteConfigMap(ctx context.Context, configMap *v1.ConfigMa
 		return s.cli.CoreV1().ConfigMaps(namespace).Delete(ctx, configMap.Name, metav1.DeleteOptions{})
 	}
 	return nil
+}
+
+func (s *fioStepper) createPV(ctx context.Context, volumeHandle string, size string, mountOptions []string, csiDriverName string) (*v1.PersistentVolume, error) {
+	sizeResource, err := resource.ParseQuantity(size)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to parse PV size (%s)", size)
+	}
+
+	storageClassName := "kubestr-static-pv"
+
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "kubestr-fio-pv-",
+		},
+		Spec: v1.PersistentVolumeSpec{
+			Capacity: v1.ResourceList{
+				v1.ResourceStorage: sizeResource,
+			},
+			AccessModes:                   []v1.PersistentVolumeAccessMode{v1.ReadWriteMany},
+			StorageClassName:              storageClassName,
+			PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimRetain,
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				CSI: &v1.CSIPersistentVolumeSource{
+					Driver:       csiDriverName,
+					VolumeHandle: volumeHandle,
+				},
+			},
+			MountOptions: mountOptions,
+		},
+	}
+
+	createdPV, err := s.cli.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return createdPV, nil
+}
+
+func (s *fioStepper) deletePV(ctx context.Context, pvName string) error {
+	return s.cli.CoreV1().PersistentVolumes().Delete(ctx, pvName, metav1.DeleteOptions{})
+}
+
+func (s *fioStepper) createStaticPVC(ctx context.Context, pvName, size, namespace string, csiDriverName string) (*v1.PersistentVolumeClaim, error) {
+	sizeResource, err := resource.ParseQuantity(size)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to parse PVC size (%s)", size)
+	}
+
+	// Use the same storage class name as PV for static binding
+	storageClassName := "kubestr-static-pv"
+
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: PVCGenerateName,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes:      []v1.PersistentVolumeAccessMode{v1.ReadWriteMany},
+			StorageClassName: &storageClassName,
+			Resources: v1.VolumeResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): sizeResource,
+				},
+			},
+			VolumeName: pvName,
+		},
+	}
+
+	createdPVC, err := s.cli.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, pvc, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return createdPVC, nil
 }
 
 func fioTestFilename(configMap map[string]string) (string, error) {
